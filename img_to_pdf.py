@@ -179,6 +179,19 @@ class App(_BaseClass):
         self._count_lbl.config(
             text=f"{n} file(s) queued" if n else "No files added")
 
+    # ── UI update helpers (safe to call from any thread) ─────────────────────
+
+    def _ui_set_status(self, text: str):
+        self.after(0, lambda: self._status.set(text))
+
+    def _ui_mark_row(self, i: int, success: bool, text: str):
+        fg = GREEN if success else RED
+        self.after(0, lambda: self._lb.itemconfig(
+            i, fg=fg, selectforeground=fg, text=text))
+
+    def _ui_finish(self):
+        self.after(0, lambda: self._btn.config(state="normal"))
+
     # ── conversion ───────────────────────────────────────────────────────────
 
     def _start_conversion(self):
@@ -190,27 +203,31 @@ class App(_BaseClass):
 
     def _run(self):
         total, errors = len(self._files), []
-        for i, path in enumerate(self._files):
-            self._status.set(
-                f"Converting {i + 1} / {total}  —  {os.path.basename(path)}")
-            try:
-                _out, pages = convert(path)
-                self._lb.itemconfig(
-                    i, fg=GREEN, selectforeground=GREEN,
-                    text=f"✓  {os.path.basename(path)}  ({pages} pages)")
-            except Exception as exc:
-                errors.append(os.path.basename(path))
-                self._lb.itemconfig(
-                    i, fg=RED, selectforeground=RED,
-                    text=f"✗  {os.path.basename(path)}  — {exc}")
-
-        if errors:
-            self._status.set(
-                f"Done — {len(errors)} error(s): {', '.join(errors)}")
-        else:
-            self._status.set(
-                f"All {total} PDF(s) saved next to the original images.")
-        self._btn.config(state="normal")
+        try:
+            for i, path in enumerate(self._files):
+                self._ui_set_status(
+                    f"Converting {i + 1} / {total}  —  {os.path.basename(path)}")
+                try:
+                    _out, pages = convert(path)
+                    self._ui_mark_row(
+                        i, True,
+                        f"✓  {os.path.basename(path)}  ({pages} pages)")
+                except Exception as exc:
+                    print(f"Error converting {path}: {exc}", file=sys.stderr)
+                    errors.append(os.path.basename(path))
+                    self._ui_mark_row(
+                        i, False,
+                        f"✗  {os.path.basename(path)}  — {exc}")
+        except Exception as exc:
+            print(f"Unexpected error in conversion thread: {exc}", file=sys.stderr)
+        finally:
+            if errors:
+                self._ui_set_status(
+                    f"Done — {len(errors)} error(s): {', '.join(errors)}")
+            else:
+                self._ui_set_status(
+                    f"All {total} PDF(s) saved next to the original images.")
+            self._ui_finish()
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
