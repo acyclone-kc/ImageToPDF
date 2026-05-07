@@ -20,7 +20,7 @@ jobs:
       - name: Build EXE
         run: >
           pyinstaller
-          --onedir
+          --onefile
           --windowed
           --name "ImageToPDF"
           --hidden-import tkinterdnd2
