@@ -1,0 +1,35 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:   # run manually from the Actions tab
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pillow tkinterdnd2 pyinstaller
+
+      - name: Build EXE
+        run: >
+          pyinstaller
+          --onedir
+          --windowed
+          --name "ImageToPDF"
+          --hidden-import tkinterdnd2
+          --collect-all tkinterdnd2
+          img_to_pdf.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImageToPDF-Windows
+          path: dist/ImageToPDF/
+          retention-days: 30
