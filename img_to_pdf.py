@@ -73,6 +73,26 @@ def output_path(input_path: str, out_dir: str | None,
     return out
 
 
+def _skip_name(name: str) -> bool:
+    """Hidden files, macOS "._" sidecars, and NAS metadata folders like
+    Synology's @eaDir / #recycle."""
+    return name.startswith((".", "@", "#"))
+
+
+def find_files(folder: str, exclude_dir: str | None = None) -> list[str]:
+    """All supported files under folder, including subfolders, in name order.
+    exclude_dir (e.g. the output folder, if it's inside) is not searched."""
+    exclude = os.path.realpath(exclude_dir) if exclude_dir else None
+    found = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not _skip_name(d)
+                         and os.path.realpath(os.path.join(root, d)) != exclude)
+        for f in sorted(files, key=str.lower):
+            if not _skip_name(f) and os.path.splitext(f)[1].lower() in EXTS:
+                found.append(os.path.join(root, f))
+    return found
+
+
 def convert(input_path: str, out: str) -> int:
     """Convert input_path to a letter-size PDF at `out`; returns page count."""
     if os.path.splitext(input_path)[1].lower() == ".pdf":
@@ -194,6 +214,7 @@ class App(_BaseClass):
         self.minsize(480, 470)
         self.configure(bg=BG)
         self._files: list[str] = []
+        self._labels: list[str] = []
         self._settings = _load_settings()
         # None = save each PDF next to its original
         self._out_dir: str | None = self._settings.get("out_dir") or None
@@ -205,7 +226,7 @@ class App(_BaseClass):
     # ── layout ───────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        zone_top = ("Drop files here  •  or click to Browse"
+        zone_top = ("Drop files or folders here  •  or click to Browse"
                     if _DND else "Click to Browse for files")
 
         zone = tk.Frame(self, bg="#dbeafe", relief="groove", bd=2,
@@ -214,7 +235,7 @@ class App(_BaseClass):
         zone.pack_propagate(False)
         tk.Label(zone, text=zone_top, bg="#dbeafe", fg=BLUE,
                  font=("Helvetica", 13, "bold")).pack(expand=True, pady=(20, 2))
-        tk.Label(zone, text="JPG / PNG / HEIC / PDF  •  multiple files OK",
+        tk.Label(zone, text="JPG / PNG / HEIC / PDF  •  folders include subfolders",
                  bg="#dbeafe", fg=GRAY,
                  font=("Helvetica", 10), justify="center").pack()
 
@@ -231,7 +252,8 @@ class App(_BaseClass):
                                    font=("Helvetica", 10))
         self._count_lbl.pack(side="left")
         for label, cmd in (("Clear all", self._clear),
-                           ("Remove selected", self._remove_selected)):
+                           ("Remove selected", self._remove_selected),
+                           ("Add folder…", self._browse_folder)):
             tk.Button(hdr, text=label, font=("Helvetica", 9), relief="flat",
                       bg=BG, fg=GRAY, cursor="hand2",
                       command=cmd).pack(side="right", padx=(0, 6))
@@ -284,18 +306,38 @@ class App(_BaseClass):
     # ── file management ──────────────────────────────────────────────────────
 
     def _add_paths(self, paths: list[str]):
-        existing = set(self._files)
-        added = 0
+        # (path, label) — files found inside a dropped folder are labelled
+        # with their path relative to it, e.g. "Trip/Day 1/IMG_0001.heic".
+        candidates = []
         for p in paths:
             p = p.strip().strip("{}")
-            if p and os.path.splitext(p)[1].lower() in EXTS and p not in existing:
+            if not p:
+                continue
+            if os.path.isdir(p):
+                parent = os.path.dirname(os.path.abspath(p))
+                candidates += [(f, os.path.relpath(f, parent))
+                               for f in find_files(p, self._out_dir)]
+            elif os.path.splitext(p)[1].lower() in EXTS:
+                candidates.append((p, os.path.basename(p)))
+
+        existing = {os.path.abspath(f) for f in self._files}
+        added = 0
+        for p, label in candidates:
+            key = os.path.abspath(p)
+            if key not in existing:
                 self._files.append(p)
-                self._lb.insert("end", os.path.basename(p))
-                existing.add(p)
+                self._labels.append(label)
+                self._lb.insert("end", label)
+                existing.add(key)
                 added += 1
         self._refresh_count()
         if added:
+            self._lb.see("end")
             self._status.set(f"Added {added} file(s).")
+        elif candidates:
+            self._status.set("Those files are already in the list.")
+        elif paths:
+            self._status.set("No JPG / PNG / HEIC / PDF files found.")
 
     def _on_drop(self, event):
         self._add_paths(self.tk.splitlist(event.data))
@@ -309,14 +351,21 @@ class App(_BaseClass):
         )
         self._add_paths(list(paths))
 
+    def _browse_folder(self):
+        d = filedialog.askdirectory(title="Add every image/PDF in a folder")
+        if d:
+            self._add_paths([d])
+
     def _remove_selected(self):
         for i in reversed(self._lb.curselection()):
             self._files.pop(i)
+            self._labels.pop(i)
             self._lb.delete(i)
         self._refresh_count()
 
     def _clear(self):
         self._files.clear()
+        self._labels.clear()
         self._lb.delete(0, "end")
         self._refresh_count()
         self._status.set("Ready — add files above.")
@@ -393,10 +442,11 @@ class App(_BaseClass):
                 self._status.set(f"Can't use output folder: {exc}")
                 return
         self._btn.config(state="disabled")
-        threading.Thread(target=self._run, args=(list(self._files), out_dir),
+        threading.Thread(target=self._run,
+                         args=(list(self._files), list(self._labels), out_dir),
                          daemon=True).start()
 
-    def _run(self, files: list[str], out_dir: str | None):
+    def _run(self, files: list[str], labels: list[str], out_dir: str | None):
         total, errors = len(files), []
         taken: set[str] = set()
         try:
@@ -409,14 +459,14 @@ class App(_BaseClass):
                     self._last_out_dir = os.path.dirname(out)
                     self._ui_mark_row(
                         i, True,
-                        f"✓  {os.path.basename(path)}  →  "
+                        f"✓  {labels[i]}  →  "
                         f"{os.path.basename(out)}  ({pages} pages)")
                 except Exception as exc:
                     print(f"Error converting {path}: {exc}", file=sys.stderr)
                     errors.append(os.path.basename(path))
                     self._ui_mark_row(
                         i, False,
-                        f"✗  {os.path.basename(path)}  — {exc}")
+                        f"✗  {labels[i]}  — {exc}")
         except Exception as exc:
             print(f"Unexpected error in conversion thread: {exc}", file=sys.stderr)
         finally:
@@ -435,6 +485,4 @@ class App(_BaseClass):
 # ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    preloaded = [p for p in sys.argv[1:]
-                 if os.path.splitext(p)[1].lower() in EXTS]
-    App(preloaded).mainloop()
+    App(sys.argv[1:]).mainloop()
