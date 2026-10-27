@@ -26,7 +26,9 @@ jobs:
           --hidden-import tkinterdnd2
           --collect-all tkinterdnd2
           --collect-all pillow_heif
-          --collect-all pymupdf
+          --hidden-import pymupdf
+          --exclude-module onnxruntime
+          --exclude-module numpy
           img_to_pdf.py
 
       - name: Upload artifact
