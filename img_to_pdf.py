@@ -7,7 +7,9 @@ Converts each JPG/PNG/HEIC image, or re-lays-out each PDF, into a
 letter-size PDF (8.5" x 11"). Tall content is split across pages.
 """
 
+import json
 import os
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -51,13 +53,34 @@ def _fit_scale(w: float, h: float, cw: float, ch: float) -> float | None:
     return fit if fit >= FIT_THRESHOLD * width_scale else None
 
 
-def convert(input_path: str) -> tuple[str, int]:
+def output_path(input_path: str, out_dir: str | None,
+                taken: set[str]) -> str:
+    """Where to write the PDF for input_path. out_dir=None means next to the
+    original. Never returns the input file itself, and never repeats a path
+    already in `taken` (e.g. photo.jpg and photo.heic in one batch)."""
+    src_dir, name = os.path.split(os.path.abspath(input_path))
+    stem, ext = os.path.splitext(name)
+    out_dir = out_dir or src_dir
+    if (ext.lower() == ".pdf"
+            and os.path.realpath(out_dir) == os.path.realpath(src_dir)):
+        stem += "_letter"
+    out = os.path.join(out_dir, stem + ".pdf")
+    n = 2
+    while os.path.normcase(out) in taken:
+        out = os.path.join(out_dir, f"{stem} ({n}).pdf")
+        n += 1
+    taken.add(os.path.normcase(out))
+    return out
+
+
+def convert(input_path: str, out: str) -> int:
+    """Convert input_path to a letter-size PDF at `out`; returns page count."""
     if os.path.splitext(input_path)[1].lower() == ".pdf":
-        return convert_pdf(input_path)
-    return convert_image(input_path)
+        return convert_pdf(input_path, out)
+    return convert_image(input_path, out)
 
 
-def convert_image(input_path: str) -> tuple[str, int]:
+def convert_image(input_path: str, out: str) -> int:
     pw = int(PAGE_W_IN * DPI)
     ph = int(PAGE_H_IN * DPI)
     m  = int(MARGIN_IN  * DPI)
@@ -81,13 +104,12 @@ def convert_image(input_path: str) -> tuple[str, int]:
             pages.append(page)
             y += ch
 
-    out = os.path.splitext(input_path)[0] + ".pdf"
     pages[0].save(out, save_all=True, append_images=pages[1:],
                   resolution=DPI)
-    return out, len(pages)
+    return len(pages)
 
 
-def convert_pdf(input_path: str) -> tuple[str, int]:
+def convert_pdf(input_path: str, out: str) -> int:
     """Re-lay-out every page of a PDF onto letter-size pages. Content stays
     vector (text remains sharp and selectable)."""
     pw, ph = PAGE_W_IN * 72, PAGE_H_IN * 72
@@ -119,10 +141,9 @@ def convert_pdf(input_path: str) -> tuple[str, int]:
                 clip=pymupdf.Rect(r.x0, y, r.x1, y1))
             y = y1
 
-    out = os.path.splitext(input_path)[0] + "_letter.pdf"
     n = dst.page_count
     dst.save(out, garbage=3, deflate=True)
-    return out, n
+    return n
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -136,16 +157,47 @@ GRAY  = "#6b7280"
 
 _BaseClass = TkinterDnD.Tk if _DND else tk.Tk
 
+SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".imagetopdf.json")
+
+
+def _load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_settings(settings: dict):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+    except Exception as exc:
+        print(f"Could not save settings: {exc}", file=sys.stderr)
+
+
+def _open_in_file_manager(path: str):
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
 
 class App(_BaseClass):
 
     def __init__(self, preloaded: list[str]):
         super().__init__()
         self.title("Image → PDF Converter")
-        self.geometry("560x520")
-        self.minsize(480, 420)
+        self.geometry("560x570")
+        self.minsize(480, 470)
         self.configure(bg=BG)
         self._files: list[str] = []
+        self._settings = _load_settings()
+        # None = save each PDF next to its original
+        self._out_dir: str | None = self._settings.get("out_dir") or None
+        self._last_out_dir: str | None = None
         self._build_ui()
         if preloaded:
             self._add_paths(preloaded)
@@ -195,6 +247,24 @@ class App(_BaseClass):
                               relief="groove", bd=1, activestyle="none")
         self._lb.pack(fill="both", expand=True)
         sb.config(command=self._lb.yview)
+
+        # Output folder row
+        out = tk.Frame(self, bg=BG)
+        out.pack(fill="x", padx=18, pady=(6, 0))
+        tk.Label(out, text="Save to:", bg=BG, fg="black",
+                 font=("Helvetica", 10, "bold")).pack(side="left")
+        self._out_lbl = tk.Label(out, bg=BG, fg=GRAY, anchor="w",
+                                 font=("Helvetica", 10))
+        self._out_lbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        btns = tk.Frame(self, bg=BG)
+        btns.pack(fill="x", padx=18)
+        for label, cmd in (("Choose folder…", self._choose_out_dir),
+                           ("Next to originals", self._reset_out_dir),
+                           ("Open output folder", self._open_output)):
+            tk.Button(btns, text=label, font=("Helvetica", 9), relief="flat",
+                      bg=BG, fg=BLUE, cursor="hand2",
+                      command=cmd).pack(side="left", padx=(0, 6))
+        self._refresh_out_dir()
 
         # Bottom bar
         bar = tk.Frame(self, bg=BG)
@@ -251,6 +321,41 @@ class App(_BaseClass):
         self._refresh_count()
         self._status.set("Ready — add files above.")
 
+    def _choose_out_dir(self):
+        d = filedialog.askdirectory(
+            title="Choose a folder for the converted PDFs",
+            initialdir=self._out_dir or os.path.expanduser("~"),
+            mustexist=False)
+        if d:
+            self._set_out_dir(d)
+
+    def _reset_out_dir(self):
+        self._set_out_dir(None)
+
+    def _set_out_dir(self, d: str | None):
+        self._out_dir = d
+        self._settings["out_dir"] = d
+        _save_settings(self._settings)
+        self._refresh_out_dir()
+
+    def _refresh_out_dir(self):
+        if self._out_dir:
+            path = self._out_dir
+            if len(path) > 60:
+                path = "…" + path[-59:]
+            self._out_lbl.config(text=path, fg="black")
+        else:
+            self._out_lbl.config(text="Same folder as each original", fg=GRAY)
+
+    def _open_output(self):
+        target = self._out_dir or self._last_out_dir
+        if not target and self._files:
+            target = os.path.dirname(os.path.abspath(self._files[0]))
+        if target and os.path.isdir(target):
+            _open_in_file_manager(target)
+        else:
+            self._status.set("Nothing to open yet.")
+
     def _refresh_count(self):
         n = len(self._files)
         self._count_lbl.config(
@@ -263,8 +368,13 @@ class App(_BaseClass):
 
     def _ui_mark_row(self, i: int, success: bool, text: str):
         fg = GREEN if success else RED
-        self.after(0, lambda: self._lb.itemconfig(
-            i, fg=fg, selectforeground=fg, text=text))
+
+        def update():
+            # Listbox rows can't be edited in place; replace the row.
+            self._lb.delete(i)
+            self._lb.insert(i, text)
+            self._lb.itemconfig(i, fg=fg, selectforeground=fg)
+        self.after(0, update)
 
     def _ui_finish(self):
         self.after(0, lambda: self._btn.config(state="normal"))
@@ -275,20 +385,32 @@ class App(_BaseClass):
         if not self._files:
             self._status.set("Add some files first.")
             return
+        out_dir = self._out_dir
+        if out_dir:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as exc:
+                self._status.set(f"Can't use output folder: {exc}")
+                return
         self._btn.config(state="disabled")
-        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._run, args=(list(self._files), out_dir),
+                         daemon=True).start()
 
-    def _run(self):
-        total, errors = len(self._files), []
+    def _run(self, files: list[str], out_dir: str | None):
+        total, errors = len(files), []
+        taken: set[str] = set()
         try:
-            for i, path in enumerate(self._files):
+            for i, path in enumerate(files):
                 self._ui_set_status(
                     f"Converting {i + 1} / {total}  —  {os.path.basename(path)}")
                 try:
-                    _out, pages = convert(path)
+                    out = output_path(path, out_dir, taken)
+                    pages = convert(path, out)
+                    self._last_out_dir = os.path.dirname(out)
                     self._ui_mark_row(
                         i, True,
-                        f"✓  {os.path.basename(path)}  ({pages} pages)")
+                        f"✓  {os.path.basename(path)}  →  "
+                        f"{os.path.basename(out)}  ({pages} pages)")
                 except Exception as exc:
                     print(f"Error converting {path}: {exc}", file=sys.stderr)
                     errors.append(os.path.basename(path))
@@ -301,6 +423,9 @@ class App(_BaseClass):
             if errors:
                 self._ui_set_status(
                     f"Done — {len(errors)} error(s): {', '.join(errors)}")
+            elif out_dir:
+                self._ui_set_status(
+                    f"All {total} PDF(s) saved to {os.path.basename(out_dir)}.")
             else:
                 self._ui_set_status(
                     f"All {total} PDF(s) saved next to the originals.")
