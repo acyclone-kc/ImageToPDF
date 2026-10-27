@@ -2,8 +2,9 @@
 """
 Image → PDF Converter
 
-Drag image files directly into the window, or click "Browse".
-Converts each JPG/PNG to a multi-page letter-size PDF (8.5" wide).
+Drag files directly into the window, or click "Browse".
+Converts each JPG/PNG/HEIC image, or re-lays-out each PDF, into a
+letter-size PDF (8.5" x 11"). Tall content is split across pages.
 """
 
 import os
@@ -12,7 +13,14 @@ import threading
 import tkinter as tk
 from tkinter import filedialog
 
-from PIL import Image
+import pymupdf
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
+# Pillow loads format plugins lazily, but its PDF writer needs the JPEG
+# plugin without loading it — load everything up front.
+Image.init()
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -26,28 +34,95 @@ DPI        = 150
 PAGE_W_IN  = 8.5
 PAGE_H_IN  = 11.0
 MARGIN_IN  = 0.25
-EXTS       = {".jpg", ".jpeg", ".png"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif"}
+EXTS       = IMAGE_EXTS | {".pdf"}
+
+# If shrinking content to fit a single page keeps it at least this fraction
+# of its full-width size, fit it on one page instead of splitting it.
+# (Covers A4, legal, and phone photos without leaving a sliver page.)
+FIT_THRESHOLD = 0.75
+
+
+def _fit_scale(w: float, h: float, cw: float, ch: float) -> float | None:
+    """Scale that fits (w, h) wholly inside (cw, ch), or None if the content
+    should be split across pages at full width instead."""
+    width_scale = cw / w
+    fit = min(width_scale, ch / h)
+    return fit if fit >= FIT_THRESHOLD * width_scale else None
 
 
 def convert(input_path: str) -> tuple[str, int]:
+    if os.path.splitext(input_path)[1].lower() == ".pdf":
+        return convert_pdf(input_path)
+    return convert_image(input_path)
+
+
+def convert_image(input_path: str) -> tuple[str, int]:
     pw = int(PAGE_W_IN * DPI)
     ph = int(PAGE_H_IN * DPI)
     m  = int(MARGIN_IN  * DPI)
     cw, ch = pw - 2 * m, ph - 2 * m
 
-    img = Image.open(input_path).convert("RGB")
-    img = img.resize((cw, int(img.height * cw / img.width)), Image.LANCZOS)
+    img = ImageOps.exif_transpose(Image.open(input_path)).convert("RGB")
 
-    pages, y = [], 0
-    while y < img.height:
+    fit = _fit_scale(img.width, img.height, cw, ch)
+    if fit is not None:
+        img = img.resize((round(img.width * fit), round(img.height * fit)),
+                         Image.LANCZOS)
         page = Image.new("RGB", (pw, ph), (255, 255, 255))
-        page.paste(img.crop((0, y, cw, min(y + ch, img.height))), (m, m))
-        pages.append(page)
-        y += ch
+        page.paste(img, (m + (cw - img.width) // 2, m))
+        pages = [page]
+    else:
+        img = img.resize((cw, int(img.height * cw / img.width)), Image.LANCZOS)
+        pages, y = [], 0
+        while y < img.height:
+            page = Image.new("RGB", (pw, ph), (255, 255, 255))
+            page.paste(img.crop((0, y, cw, min(y + ch, img.height))), (m, m))
+            pages.append(page)
+            y += ch
 
     out = os.path.splitext(input_path)[0] + ".pdf"
-    pages[0].save(out, save_all=True, append_images=pages[1:])
+    pages[0].save(out, save_all=True, append_images=pages[1:],
+                  resolution=DPI)
     return out, len(pages)
+
+
+def convert_pdf(input_path: str) -> tuple[str, int]:
+    """Re-lay-out every page of a PDF onto letter-size pages. Content stays
+    vector (text remains sharp and selectable)."""
+    pw, ph = PAGE_W_IN * 72, PAGE_H_IN * 72
+    m = MARGIN_IN * 72
+    cw, ch = pw - 2 * m, ph - 2 * m
+
+    src = pymupdf.open(input_path)
+    dst = pymupdf.open()
+    for pno, sp in enumerate(src):
+        # show_pdf_page ignores /Rotate, so bake rotation into the content
+        # (in memory only; the original file isn't touched).
+        if sp.rotation:
+            sp.remove_rotation()
+        r = sp.rect
+        fit = _fit_scale(r.width, r.height, cw, ch)
+        if fit is not None:
+            w, h = r.width * fit, r.height * fit
+            x0 = m + (cw - w) / 2
+            dst.new_page(width=pw, height=ph).show_pdf_page(
+                pymupdf.Rect(x0, m, x0 + w, m + h), src, pno)
+            continue
+        scale = cw / r.width
+        slice_h = ch / scale
+        y = r.y0
+        while y < r.y1 - 0.5:
+            y1 = min(y + slice_h, r.y1)
+            dst.new_page(width=pw, height=ph).show_pdf_page(
+                pymupdf.Rect(m, m, m + cw, m + (y1 - y) * scale), src, pno,
+                clip=pymupdf.Rect(r.x0, y, r.x1, y1))
+            y = y1
+
+    out = os.path.splitext(input_path)[0] + "_letter.pdf"
+    n = dst.page_count
+    dst.save(out, garbage=3, deflate=True)
+    return out, n
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -78,8 +153,8 @@ class App(_BaseClass):
     # ── layout ───────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        zone_top = ("Drop images here  •  or click to Browse"
-                    if _DND else "Click to Browse for images")
+        zone_top = ("Drop files here  •  or click to Browse"
+                    if _DND else "Click to Browse for files")
 
         zone = tk.Frame(self, bg="#dbeafe", relief="groove", bd=2,
                         cursor="hand2", height=120)
@@ -87,7 +162,7 @@ class App(_BaseClass):
         zone.pack_propagate(False)
         tk.Label(zone, text=zone_top, bg="#dbeafe", fg=BLUE,
                  font=("Helvetica", 13, "bold")).pack(expand=True, pady=(20, 2))
-        tk.Label(zone, text="JPG / PNG  •  multiple files OK",
+        tk.Label(zone, text="JPG / PNG / HEIC / PDF  •  multiple files OK",
                  bg="#dbeafe", fg=GRAY,
                  font=("Helvetica", 10), justify="center").pack()
 
@@ -124,7 +199,7 @@ class App(_BaseClass):
         # Bottom bar
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=18, pady=(4, 16))
-        self._status = tk.StringVar(value="Ready — add images above.")
+        self._status = tk.StringVar(value="Ready — add files above.")
         tk.Label(bar, textvariable=self._status, bg=BG, fg=GRAY,
                  font=("Helvetica", 10), anchor="w").pack(side="left",
                                                            fill="x", expand=True)
@@ -157,8 +232,10 @@ class App(_BaseClass):
 
     def _browse(self):
         paths = filedialog.askopenfilenames(
-            title="Select images",
-            filetypes=[("Images", "*.jpg *.jpeg *.png"), ("All files", "*.*")],
+            title="Select images or PDFs",
+            filetypes=[("Images & PDFs",
+                        "*.jpg *.jpeg *.png *.heic *.heif *.pdf"),
+                       ("All files", "*.*")],
         )
         self._add_paths(list(paths))
 
@@ -172,7 +249,7 @@ class App(_BaseClass):
         self._files.clear()
         self._lb.delete(0, "end")
         self._refresh_count()
-        self._status.set("Ready — add images above.")
+        self._status.set("Ready — add files above.")
 
     def _refresh_count(self):
         n = len(self._files)
@@ -196,7 +273,7 @@ class App(_BaseClass):
 
     def _start_conversion(self):
         if not self._files:
-            self._status.set("Add some images first.")
+            self._status.set("Add some files first.")
             return
         self._btn.config(state="disabled")
         threading.Thread(target=self._run, daemon=True).start()
@@ -226,7 +303,7 @@ class App(_BaseClass):
                     f"Done — {len(errors)} error(s): {', '.join(errors)}")
             else:
                 self._ui_set_status(
-                    f"All {total} PDF(s) saved next to the original images.")
+                    f"All {total} PDF(s) saved next to the originals.")
             self._ui_finish()
 
 
